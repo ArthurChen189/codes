@@ -195,6 +195,12 @@ def filter_schema(dataset, dataset_type, sic, num_top_k_tables = 5, num_top_k_co
             table_indices = np.argsort(-np.array(table_probs), kind="stable")[:num_top_k_tables].tolist()
         elif dataset_type == "train":
             table_indices = [table_idx for table_idx, table_label in enumerate(data["table_labels"]) if table_label == 1]
+            # From the paper:
+            # Aiming for consistency in distribution between test and training data, if the number of the used tables falls below 𝑡𝑜𝑝𝑘1,
+            # we incorporate randomly selected, unused tables from the database as padding. 
+            # A similar procedure is adopted for columns, ensuring each retained table contains 𝑡𝑜𝑝𝑘2 columns.
+
+            # For the reproduction purpose, let's not use schema filtering for training and evaluation.
             if len(table_indices) < num_top_k_tables:
                 unused_table_indices = [table_idx for table_idx, table_label in enumerate(data["table_labels"]) if table_label == 0]
                 table_indices += random.sample(unused_table_indices, min(len(unused_table_indices), num_top_k_tables - len(table_indices)))
