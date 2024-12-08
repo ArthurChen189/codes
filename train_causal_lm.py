@@ -3,13 +3,14 @@ import os
 import math
 import time
 import torch
+from tqdm import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from utils.load_pt_dataset import PretrainDataset
 from utils.load_sft_dataset import SFTSQLGenerationDataset
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from accelerate.utils import set_seed
+from accelerate.utils import set_seed, write_basic_config
 from accelerate import Accelerator
 from torch.utils.tensorboard import SummaryWriter
 from utils.lr_scheduler import LinearWarmupCosineAnnealingLR
@@ -127,7 +128,8 @@ def train(opt):
     accelerator.print("using LLM from:", opt.pretrained_model_name_or_path)
 
     tokenizer = AutoTokenizer.from_pretrained(opt.pretrained_model_name_or_path)
-    model = AutoModelForCausalLM.from_pretrained(opt.pretrained_model_name_or_path)
+    # model = AutoModelForCausalLM.from_pretrained(opt.pretrained_model_name_or_path)
+    model = AutoModelForCausalLM.from_pretrained(opt.pretrained_model_name_or_path, attn_implementation = "flash_attention_2")
     tokenizer.pad_token_id = tokenizer.eos_token_id
     model.config.pad_token_id = tokenizer.eos_token_id
     
@@ -189,13 +191,7 @@ def train(opt):
             accelerator.print("skip {}-th epoch".format(epoch))
             continue
         accelerator.print("Start training epoch:", epoch+1)
-        for batch_idx, batch in enumerate(dataloader):
-            # if batch["attention_mask"].all():
-            # accelerator.print("\n----------------\n".join(tokenizer.batch_decode(batch["input_ids"], skip_special_tokens = False)))
-            # accelerator.print(batch["input_ids"])
-            # accelerator.print(batch["attention_mask"])
-            # accelerator.print(batch["labels"])
-            # accelerator.print(batch["input_ids"].shape)
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc = "Training epoch {}".format(epoch+1))):
 
             if opt.mode == "pt" and opt.resume_from_checkpoint and resume_batch_idx > batch_idx:
                 accelerator.print("skip {}-th batch".format(batch_idx))
@@ -218,7 +214,7 @@ def train(opt):
                 global_completed_steps += 1
                 accelerator.print("GPU 0, step {}, loss {}".format(global_completed_steps, accumulation_loss / accelerator.gradient_accumulation_steps))
                 accelerator.print("GPU 0, step {}, lr state dict:".format(global_completed_steps), lr_scheduler.state_dict())
-                accelerator.print(time.time()-st)
+                accelerator.print("time elapsed: {}".format(time.time()-st))
                 st = time.time()
 
                 writer.add_scalar(
@@ -249,5 +245,6 @@ def train(opt):
             checkpoint_model_optimizer_scheduler(opt.output_ckpt_dir, model, global_completed_steps, lr_scheduler, accelerator)
 
 if __name__ == "__main__":
+    write_basic_config() # initialize the distributed environment using accelerate
     opt = parse_option()
     train(opt)
