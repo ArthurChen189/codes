@@ -34,7 +34,7 @@ def execute_sql_long_time_limitation(cursor, sql):
 
     return cursor.fetchall()
 
-def check_sql_executability(generated_sql, db):
+def check_sql_executability(generated_sql, db, verbose: bool = False):
     if generated_sql.strip() == "":
         return "Error: empty string"
     try:
@@ -43,27 +43,12 @@ def check_sql_executability(generated_sql, db):
         execute_sql(cursor, "EXPLAIN QUERY PLAN " + generated_sql)
         execution_error = None
     except FunctionTimedOut as fto:
-        print("SQL execution time out error: {}.".format(fto))
+        if verbose:
+            print("SQL execution time out error: {}.".format(fto))
         execution_error = "SQL execution times out."
     except Exception as e:
-        print("SQL execution runtime error: {}.".format(e))
-        execution_error = str(e)
-    
-    return execution_error
-
-def check_sql_executability_with_result(generated_sql, db):
-    if generated_sql.strip() == "":
-        return "Error: empty string"
-    try:
-        cursor = get_cursor_from_path(db)
-        # use `EXPLAIN QUERY PLAN` to avoid actually executing
-        execute_sql(cursor, "EXPLAIN QUERY PLAN " + generated_sql)
-        execution_error = None
-    except FunctionTimedOut as fto:
-        print("SQL execution time out error: {}.".format(fto))
-        execution_error = "SQL execution times out."
-    except Exception as e:
-        print("SQL execution runtime error: {}.".format(e))
+        if verbose:
+            print("SQL execution runtime error: {}.".format(e))
         execution_error = str(e)
     
     return execution_error
