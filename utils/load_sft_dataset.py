@@ -63,6 +63,8 @@ class SFTSQLGenerationDataset(Dataset):
         print("apply filtering strategies...")
         if mode == "train":
             dataset = filter_schema(dataset, "train", None, table_num, column_num)
+        elif mode == "data-synthesis":
+            print("data-synthesis mode, we skip the schema filtering step.")
         elif mode == "eval":
             sic = SchemaItemClassifierInference(sic_path)
             dataset = filter_schema(dataset, "eval", sic, table_num, column_num)

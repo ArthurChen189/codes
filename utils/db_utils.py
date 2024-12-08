@@ -26,11 +26,32 @@ def execute_sql(cursor, sql):
 # execute predicted sql with a long time limitation (for buiding content index)
 @func_set_timeout(2000)
 def execute_sql_long_time_limitation(cursor, sql):
-    cursor.execute(sql)
+    try:
+        cursor.execute(sql)
+    except Exception as e:
+        print(f"SQL execution runtime error: {e}, sql: {sql}")
+        raise e
 
     return cursor.fetchall()
 
 def check_sql_executability(generated_sql, db):
+    if generated_sql.strip() == "":
+        return "Error: empty string"
+    try:
+        cursor = get_cursor_from_path(db)
+        # use `EXPLAIN QUERY PLAN` to avoid actually executing
+        execute_sql(cursor, "EXPLAIN QUERY PLAN " + generated_sql)
+        execution_error = None
+    except FunctionTimedOut as fto:
+        print("SQL execution time out error: {}.".format(fto))
+        execution_error = "SQL execution times out."
+    except Exception as e:
+        print("SQL execution runtime error: {}.".format(e))
+        execution_error = str(e)
+    
+    return execution_error
+
+def check_sql_executability_with_result(generated_sql, db):
     if generated_sql.strip() == "":
         return "Error: empty string"
     try:
@@ -72,6 +93,49 @@ def get_column_contents(column_name, table_name, cursor):
     column_contents = [content for content in column_contents if len(content) != 0 and len(content) <= 25]
 
     return column_contents
+
+import warnings
+from typing import List
+def get_column_contents_randomly(column_name: str, table_name: str, cursor: sqlite3.Cursor) -> List[str]:
+    """get two random non-null values from a column. This function is used for value demonstration. We wrap the values with backticks to help model
+    exactly match the values.
+    Args:
+        column_name (str): column name
+        table_name (str): table name
+        cursor (sqlite3.Cursor): database cursor
+
+    Returns:
+        list[str]: two random non-null values from the column
+    """    
+    select_column_sql = "SELECT DISTINCT `{}` FROM `{}` WHERE `{}` IS NOT NULL AND `rowid` >= ABS(RANDOM() % (SELECT MAX(`rowid`) FROM `{}`)) LIMIT 2;".format(column_name, table_name, column_name, table_name)
+    try:
+        results = execute_sql_long_time_limitation(cursor, select_column_sql)
+    except Exception as e:
+        column_contents = []
+    else:
+        column_contents = ['`' + str(result[0]).strip() + '`' for result in results]
+        # remove empty and extremely-long contents
+        column_contents = [content for content in column_contents if len(content) != 0 and len(content) <= 25]
+
+    return column_contents
+
+def get_a_row_contents_randomly(table_name: str, cursor: sqlite3.Cursor) -> List[str]:
+    """get two random rows from a table. This function is used for value demonstration.
+
+    Args:
+        table_name (str): table name
+        cursor (sqlite3.Cursor): database cursor
+
+    Returns:
+        list[str]: two random rows from the table
+    """    
+    select_row_sql = "SELECT * FROM `{}` WHERE `rowid` >= ABS(RANDOM() % (SELECT MAX(`rowid`) FROM `{}`)) LIMIT 2;".format(table_name, table_name)
+    results = execute_sql_long_time_limitation(cursor, select_row_sql)
+    column_contents = [str(result).strip() for result in results]
+    # remove empty and extremely-long contents
+    column_contents = [content for content in column_contents if len(content) != 0 and len(content) <= 25]
+    return column_contents
+
 
 def get_db_schema_sequence(schema):
     schema_sequence = "database schema :\n"
