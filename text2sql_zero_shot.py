@@ -14,6 +14,7 @@ def parse_option():
     parser = argparse.ArgumentParser()
     parser.add_argument('--llm_path', type = str)
     parser.add_argument('--sic_path', type = str)
+    parser.add_argument('--output_path', type = str)
     parser.add_argument('--table_num', type = int, default = 6)
     parser.add_argument('--column_num', type = int, default = 10)
 
@@ -116,9 +117,9 @@ if __name__ == "__main__":
         bird_results_dict = dict()
         for idx, (data, predicted_sql) in enumerate(zip(raw_dataset, predicted_sqls)):
             bird_results_dict[idx] = predicted_sql + "\t----- bird -----\t" + data["db_id"]
-        with open("predict_dev.json", "w", encoding = 'utf-8') as f:
+        with open(opt.output_path, "w", encoding = 'utf-8') as f:
             f.write(json.dumps(bird_results_dict, indent = 2, ensure_ascii = False))
-        os.system("sh bird_evaluation/run_evaluation.sh predict_dev.json")
+        # os.system("sh bird_evaluation/run_evaluation.sh predict_dev.json")
     elif "spider_dev" in opt.dataset_path:
         with open("pred_sqls.txt", "w", encoding = 'utf-8') as f:
             for sql in predicted_sqls:

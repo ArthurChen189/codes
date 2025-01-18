@@ -12,8 +12,9 @@ from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from accelerate.utils import set_seed, write_basic_config
 from accelerate import Accelerator
-from torch.utils.tensorboard import SummaryWriter
 from utils.lr_scheduler import LinearWarmupCosineAnnealingLR
+import neptune
+from neptune.utils import stringify_unsupported
 
 '''
 Training LLM using Huggingface Accelerate + Deepspeed.
@@ -33,11 +34,17 @@ def parse_option():
     parser.add_argument('--lr', type = float, default = 5e-5, help = "5e-5 for pre-training, 5e-6 for fine-tuning.")
     parser.add_argument('--warmup_ratio', type = float, default = 0.0, help = "ratio of total training steps used for a linear warmup from 0 to max lr.")
     parser.add_argument('--checkpointing_steps', type = int, default = 300)
-    parser.add_argument('--tensorboard_log_dir', type = str, default = "./train_logs")
+    # parser.add_argument('--tensorboard_log_dir', type = str, default = "./train_logs")
     parser.add_argument('--mode', type = str, default = "pt")
     parser.add_argument('--output_ckpt_dir', type = str, default = "./ckpts")
     parser.add_argument('--save_all_states', action = 'store_true', 
         help = "whether to save states of model, optimizer, and lr scheduler for resuming training, otherwise only model states are saved.")
+    
+    # neptune args
+    parser.add_argument('--neptune_project', type=str, default="your-workspace/your-project")
+    parser.add_argument('--neptune_api_token', type=str, required=True)
+    parser.add_argument('--neptune_name', type=str, default=None)
+    parser.add_argument('--neptune_tags', nargs='*', default=None)
 
     # args for pre-training
     parser.add_argument('--pt_data_dir', type = str, default = "./data/corpus.bin")
@@ -115,7 +122,6 @@ def sanity_check(input, target, tokenizer):
 def train(opt):
     set_seed(opt.seed)
 
-    writer = SummaryWriter(opt.tensorboard_log_dir)
     accelerator = Accelerator()
     print("accelerator.is_main_process:", accelerator.is_main_process)
     print("accelerator.device:", accelerator.device)
@@ -125,17 +131,34 @@ def train(opt):
     accelerator.print(opt)
     accelerator.print("tokens per batch:", total_batch_size * opt.block_size)
     accelerator.print("sequences per batch:", total_batch_size)
+
+    # We first search for the most recent checkpoint directory, if it doesn't exist, we start a new run
+    most_recent_ckpt_dir = None
+    if os.path.exists(opt.output_ckpt_dir):
+        import glob
+        checkpoint_dirs = glob.glob(os.path.join(opt.output_ckpt_dir, "ckpt-*"))
+        if checkpoint_dirs:
+            # Sort by checkpoint number (assuming format ckpt-{number})
+            most_recent_ckpt_dir = max(checkpoint_dirs, key=lambda x: int(x.split('-')[-1]))
+            opt.resume_from_checkpoint = opt.output_ckpt_dir
+            # Extract the checkpoint number for the resume_tag
+            opt.resume_tag = os.path.basename(most_recent_ckpt_dir).split('-')[-1]
+            accelerator.print(f"Found checkpoint directory: {most_recent_ckpt_dir}, loading model from checkpoint...")
+            opt.pretrained_model_name_or_path = most_recent_ckpt_dir
+
     accelerator.print("using LLM from:", opt.pretrained_model_name_or_path)
 
     tokenizer = AutoTokenizer.from_pretrained(opt.pretrained_model_name_or_path)
     # model = AutoModelForCausalLM.from_pretrained(opt.pretrained_model_name_or_path)
-    model = AutoModelForCausalLM.from_pretrained(opt.pretrained_model_name_or_path, attn_implementation = "flash_attention_2")
+    model = AutoModelForCausalLM.from_pretrained(opt.pretrained_model_name_or_path, 
+                                                 attn_implementation = "flash_attention_2", 
+                                                 torch_dtype = torch.bfloat16)
     tokenizer.pad_token_id = tokenizer.eos_token_id
     model.config.pad_token_id = tokenizer.eos_token_id
     
     # enable gradient checkpointing to save GPU memory, but this action would slowdown the training speed 20-30%
+    model.config.use_cache = False # disable use_cache to enable gradient checkpointing
     model.gradient_checkpointing_enable()
-
     if opt.mode == "pt":
         dataset = PretrainDataset(opt.pt_data_dir, opt.block_size)
         if accelerator.is_main_process:
@@ -168,10 +191,12 @@ def train(opt):
     accumulation_loss = 0
     global_completed_steps = 0
     model.train()
+    resume_epoch = 0
+    resume_batch_idx = 0
 
-    # resume pre-training if opt.resume_from_checkpoint is not None
-    if opt.mode == "pt" and opt.resume_from_checkpoint:
-        # resume model and optimizer states
+    # Resume training if checkpoint exists
+    if most_recent_ckpt_dir:
+        # Extract checkpoint number for the resume_tag
         global_completed_steps = resume_model_and_optimizer(model, opt.resume_from_checkpoint, opt.resume_tag)
         
         resume_epoch = global_completed_steps * accelerator.gradient_accumulation_steps // len(dataloader)
@@ -186,14 +211,56 @@ def train(opt):
         accelerator.print("lr scheduler state dict:", lr_scheduler.state_dict())
 
     st = time.time()
+
+    if accelerator.is_main_process:
+        # Initialize Neptune run instead of wandb
+        # We save the run_id in the neptune_run_id.txt file, so that we can resume the run without starting a new neptune run
+        if most_recent_ckpt_dir:
+            accelerator.print("resume neptune run, loading run_id from neptune_run_id.txt...")
+            if os.path.exists(os.path.join(opt.output_ckpt_dir, 'neptune_run_id.txt')):
+                with open(os.path.join(opt.output_ckpt_dir, 'neptune_run_id.txt'), 'r') as f:
+                    run_id = f.read()
+            else:
+                raise ValueError("neptune_run_id.txt not found")
+            run = neptune.init_run(
+                with_id=run_id,
+                project=opt.neptune_project,
+                api_token=opt.neptune_api_token,
+                name=opt.neptune_name,
+                tags=opt.neptune_tags,
+                dependencies="infer",
+            )
+        else:
+            # if we start a new run, we need to create a new neptune run
+            run = neptune.init_run(
+                project=opt.neptune_project,
+                api_token=opt.neptune_api_token,
+                name=opt.neptune_name,
+                tags=opt.neptune_tags,
+                dependencies="infer"
+        )
+            run_id = run["sys/id"].fetch()
+            if os.path.exists(os.path.join(opt.output_ckpt_dir)):
+                with open(os.path.join(opt.output_ckpt_dir, 'neptune_run_id.txt'), 'w') as f:
+                    f.write(run_id)
+            else:
+                # create the folder and file, write the run_id
+                os.makedirs(os.path.join(opt.output_ckpt_dir), exist_ok=True)
+                with open(os.path.join(opt.output_ckpt_dir, 'neptune_run_id.txt'), 'w') as f:
+                    f.write(run_id)
+        
+        # Log parameters to Neptune
+        run["config"] = stringify_unsupported(vars(opt))
+        run["total_batch_size"] = total_batch_size
+    
     for epoch in range(opt.epochs):
-        if opt.mode == "pt" and opt.resume_from_checkpoint and resume_epoch > epoch:
+        if opt.resume_from_checkpoint and resume_epoch > epoch:
             accelerator.print("skip {}-th epoch".format(epoch))
             continue
         accelerator.print("Start training epoch:", epoch+1)
         for batch_idx, batch in enumerate(tqdm(dataloader, desc = "Training epoch {}".format(epoch+1))):
 
-            if opt.mode == "pt" and opt.resume_from_checkpoint and resume_batch_idx > batch_idx:
+            if opt.resume_from_checkpoint and resume_batch_idx > batch_idx:
                 accelerator.print("skip {}-th batch".format(batch_idx))
                 continue
             
@@ -212,22 +279,20 @@ def train(opt):
             # 'accelerator.sync_gradients' checks if the accelerator has performed an optimization step on the `total_batch_size` examples
             if accelerator.sync_gradients:
                 global_completed_steps += 1
-                accelerator.print("GPU 0, step {}, loss {}".format(global_completed_steps, accumulation_loss / accelerator.gradient_accumulation_steps))
+                loss_value = accumulation_loss / accelerator.gradient_accumulation_steps
+                lr_value = lr_scheduler.get_last_lr()[0]
+                
+                accelerator.print("GPU 0, step {}, loss {}".format(global_completed_steps, loss_value))
                 accelerator.print("GPU 0, step {}, lr state dict:".format(global_completed_steps), lr_scheduler.state_dict())
                 accelerator.print("time elapsed: {}".format(time.time()-st))
                 st = time.time()
 
-                writer.add_scalar(
-                    'train-loss/gpu-{}'.format(accelerator.process_index), 
-                    accumulation_loss / accelerator.gradient_accumulation_steps, 
-                    global_completed_steps
-                )
-                writer.add_scalar(
-                    'learning-rate/gpu-{}'.format(accelerator.process_index), 
-                    lr_scheduler.get_last_lr()[0], 
-                    global_completed_steps
-                )
-                # reset accumulation_loss to 0
+                if accelerator.is_main_process:
+                    # Replace wandb logging with Neptune logging
+                    run["train/loss"].append(loss_value)
+                    run["train/learning_rate"].append(lr_value)
+                    run["train/step"].append(global_completed_steps)
+
                 accumulation_loss = 0
 
                 # save checkpoints for each checkpointing_steps total batch size
@@ -235,16 +300,26 @@ def train(opt):
                     accelerator.wait_for_everyone()
                     checkpoint_model(accelerator, model, tokenizer, opt.output_ckpt_dir, global_completed_steps)
                     if opt.save_all_states:
+                        # Remove the old checkpoint directory and its contents before saving new ones
+                        old_ckpt_dir = os.path.join(opt.output_ckpt_dir, str(opt.resume_tag))
+                        if os.path.exists(old_ckpt_dir):
+                            import shutil
+                            shutil.rmtree(old_ckpt_dir)
+                        
                         checkpoint_model_optimizer_scheduler(opt.output_ckpt_dir, model, global_completed_steps, lr_scheduler, accelerator)
+                        opt.resume_tag = global_completed_steps
 
-        # if opt.mode == "pt" or (opt.mode == "sft" and (epoch+1)%2 == 0):
         accelerator.print("in the end of an epoch, save a checkpoint")
         accelerator.wait_for_everyone()
         checkpoint_model(accelerator, model, tokenizer, opt.output_ckpt_dir, global_completed_steps)
         if opt.save_all_states:
             checkpoint_model_optimizer_scheduler(opt.output_ckpt_dir, model, global_completed_steps, lr_scheduler, accelerator)
 
+    # Stop Neptune run instead of wandb
+    if accelerator.is_main_process:
+        run.stop()
+
 if __name__ == "__main__":
-    write_basic_config() # initialize the distributed environment using accelerate
+    # write_basic_config() # initialize the distributed environment using accelerate
     opt = parse_option()
     train(opt)

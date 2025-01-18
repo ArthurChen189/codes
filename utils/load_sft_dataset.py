@@ -126,7 +126,6 @@ class SFTSQLGenerationDataset(Dataset):
             torch.cuda.empty_cache()
 
         # prepare schema sequence and content sequence
-
         for data in dataset:
             # get the schema and matched contents prompt
             data["schema_sequence"] = get_db_schema_sequence(data["schema"])
@@ -145,9 +144,9 @@ class SFTSQLGenerationDataset(Dataset):
 
         if self.mode == "train":
             target_seq = data["sql"]
-            return prepare_inputs_and_labels(prefix_seq, target_seq, self.tokenizer, self.max_tokens)
+            return prepare_inputs_and_labels_qwen(prefix_seq, target_seq, self.tokenizer, self.max_tokens)
         elif self.mode == "eval":
-            return prepare_inputs(prefix_seq, self.tokenizer, self.max_tokens)
+            return prepare_inputs_qwen(prefix_seq, self.tokenizer, self.max_tokens)
 
     def __len__(self):
         return len(self.dataset)

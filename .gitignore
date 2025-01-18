@@ -3,3 +3,10 @@ data/
 sic_ckpts/
 **/__pycache__/
 /*.json
+codes_logs/
+.neptune/
+wandb/
+train_logs/
+results/
+qwen_7b_predictions/
+*slurm*.sh
