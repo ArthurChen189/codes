@@ -331,19 +331,19 @@ if __name__ == "__main__":
     # with open("./data/sft_bird_with_evidence_train_text2sql.json", "w") as f:
     #     f.write(json.dumps(bird_with_evidence_train, indent = 2, ensure_ascii = False))
 
-    print("BIRD (with evidence) new_train")
-    # BIRD training set with evidence (9428 examples)
-    bird_with_evidence_train = spider_style_dataset(
-        dataset_path = "./data/data_synthesis_split/bird/new_train/train.json", 
-        db_path = "./data/data_synthesis_split/bird/new_train/train_databases", 
-        db_content_index_path = "./data/data_synthesis_split/bird/new_train/db_contents_index",
-        source = "bird-train",
-        table_json_path = "./data/data_synthesis_split/bird/new_train/train_tables.json",
-        use_evidence = True,
-        mode = "train"
-    )
-    with open("./data/sft_bird_with_evidence_new_train_text2sql.json", "w") as f:
-        f.write(json.dumps(bird_with_evidence_train, indent = 2, ensure_ascii = False))
+    # print("BIRD (with evidence) new_train")
+    # # BIRD training set with evidence (9428 examples)
+    # bird_with_evidence_train = spider_style_dataset(
+    #     dataset_path = "./data/data_synthesis_split/bird/new_train/train.json", 
+    #     db_path = "./data/data_synthesis_split/bird/new_train/train_databases", 
+    #     db_content_index_path = "./data/data_synthesis_split/bird/new_train/db_contents_index",
+    #     source = "bird-train",
+    #     table_json_path = "./data/data_synthesis_split/bird/new_train/train_tables.json",
+    #     use_evidence = True,
+    #     mode = "train"
+    # )
+    # with open("./data/sft_bird_with_evidence_new_train_text2sql.json", "w") as f:
+    #     f.write(json.dumps(bird_with_evidence_train, indent = 2, ensure_ascii = False))
 
     # print("Bank_Financials train")
     # # Bank_Financials train set
@@ -490,19 +490,46 @@ if __name__ == "__main__":
     # with open("./data/sft_bird_with_evidence_dev_text2sql.json", "w") as f:
     #     f.write(json.dumps(bird_with_evidence_dev, indent = 2, ensure_ascii = False))
 
-    print("BIRD-dev (with evidence)")
-    # BIRD dev set (1534 examples)
-    bird_with_evidence_dev = spider_style_dataset(
-        dataset_path = "./data/data_synthesis_split/bird/new_dev/dev.json", 
-        db_path = "./data/data_synthesis_split/bird/new_dev/dev_databases", 
-        db_content_index_path = "./data/data_synthesis_split/bird/new_dev/db_contents_index",
-        source = "bird-dev", # note that the dev set is derived from the training set
-        table_json_path = "./data/data_synthesis_split/bird/new_dev/dev_tables.json",
-        use_evidence = True,
-        mode = "dev"
-    )
-    with open("./data/sft_bird_with_evidence_new_dev_text2sql.json", "w") as f:
-        f.write(json.dumps(bird_with_evidence_dev, indent = 2, ensure_ascii = False))
+    # print("BIRD-dev (with evidence)")
+    # # BIRD dev set (1534 examples)
+    # bird_with_evidence_dev = spider_style_dataset(
+    #     dataset_path = "./data/data_synthesis_split/bird/new_dev/dev.json", 
+    #     db_path = "./data/data_synthesis_split/bird/new_dev/dev_databases", 
+    #     db_content_index_path = "./data/data_synthesis_split/bird/new_dev/db_contents_index",
+    #     source = "bird-dev", # note that the dev set is derived from the training set
+    #     table_json_path = "./data/data_synthesis_split/bird/new_dev/dev_tables.json",
+    #     use_evidence = True,
+    #     mode = "dev"
+    # )
+    # with open("./data/sft_bird_with_evidence_new_dev_text2sql.json", "w") as f:
+    #     f.write(json.dumps(bird_with_evidence_dev, indent = 2, ensure_ascii = False))
+
+    print("BIRD-dev-synthetic (with evidence)")
+    # synthetic data for BIRD dev set (? examples)
+    # note that the synthetic data is derived from the new_dev set
+    def get_path():
+        from pathlib import Path
+        data_folder_path = Path("/h/arthur/Workspace/data_synthesis/data/text2sql/data")
+        db_folder_paths = data_folder_path.glob("*_*/")
+
+        for db_folder_path in db_folder_paths:
+            for file_path in db_folder_path.glob("*.json"):
+                yield file_path
+
+    for dataset_path in get_path():
+        print(f"processing {dataset_path}")
+        bird_with_evidence_dev = spider_style_dataset(
+            dataset_path = dataset_path, 
+            db_path = "./data/data_synthesis_split/bird/new_dev/dev_databases", 
+            db_content_index_path = "./data/data_synthesis_split/bird/new_dev/db_contents_index",
+            source = "bird-dev", # note that the dev set is derived from the training set 
+            table_json_path = "./data/data_synthesis_split/bird/new_dev/dev_tables.json",
+            use_evidence = True,
+            mode = "dev"
+        )
+        db_id = dataset_path.parent.stem
+        with open("./data/synthetic_data_balanced/{}_{}_text2sql.json".format(dataset_path.stem, db_id), "w") as f:
+            f.write(json.dumps(bird_with_evidence_dev, indent = 2, ensure_ascii = False))
 
 
     # print("Bank_Financials dev set")
