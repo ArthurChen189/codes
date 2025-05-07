@@ -15,6 +15,7 @@ from accelerate import Accelerator
 from utils.lr_scheduler import LinearWarmupCosineAnnealingLR
 import neptune
 from neptune.utils import stringify_unsupported
+import glob
 
 '''
 Training LLM using Huggingface Accelerate + Deepspeed.
@@ -34,6 +35,7 @@ def parse_option():
     parser.add_argument('--lr', type = float, default = 5e-5, help = "5e-5 for pre-training, 5e-6 for fine-tuning.")
     parser.add_argument('--warmup_ratio', type = float, default = 0.0, help = "ratio of total training steps used for a linear warmup from 0 to max lr.")
     parser.add_argument('--checkpointing_steps', type = int, default = 300)
+    parser.add_argument('--patience', type = int, default = 3, help = "Number of epochs to wait for validation loss improvement before early stopping.")
     # parser.add_argument('--tensorboard_log_dir', type = str, default = "./train_logs")
     parser.add_argument('--mode', type = str, default = "pt")
     parser.add_argument('--output_ckpt_dir', type = str, default = "./ckpts")
@@ -53,21 +55,36 @@ def parse_option():
     parser.add_argument('--resume_tag', type = str, default = None)
     
     # args for supervised fine-tuning
-    parser.add_argument('--text2sql_data_dir', type = str, default = "./data/sft_train_text2sql.json")
+    parser.add_argument('--text2sql_data_dir', type = str, required = True)
     parser.add_argument('--table_num', type = int, default = 6)
     parser.add_argument('--column_num', type = int, default = 10)
-    
-    opt = parser.parse_args()
+    parser.add_argument('--max_num_ckpts', type = int, default = 4)
+    parser.add_argument('--synthesize_question', action = 'store_true', help = "whether to train to synthesize questions")
+
+    # args for data synthesis evaluation
+    parser.add_argument('--prompt_mode', type = str, choices = ["train", "eval", "train-zero-shot"])
+
+    opt = parser.parse_args()   
 
     return opt
 
-def checkpoint_model_optimizer_scheduler(checkpoint_folder, model, last_global_step, lr_scheduler, accelerator):
+def checkpoint_model_optimizer_scheduler(checkpoint_folder, model, last_global_step, lr_scheduler, accelerator, max_num_ckpts):
     """
     Utility function for checkpointing model + optimizer dictionaries
     The main purpose for this is to be able to resume training from that instant again
     """
+
+    # remove the old checkpoint to make sure the number of checkpoints is less than max_num_ckpts
+    if accelerator.is_main_process:
+        checkpoint_dirs = glob.glob(os.path.join(checkpoint_folder, "ckpt-*"))
+        if len(checkpoint_dirs) >= max_num_ckpts:
+            oldest_checkpoint_dir = min(checkpoint_dirs, key=lambda x: int(x.split('-')[-1]))
+            accelerator.print(f"Removing oldest checkpoint directory: {oldest_checkpoint_dir}")
+        import shutil
+        shutil.rmtree(oldest_checkpoint_dir)
+
     checkpoint_state_dict = {
-        "last_global_step": last_global_step,
+        "last_global_step": last_global_step
     }
 
     accelerator.print("==> saving model and optimizer <==")
@@ -84,17 +101,29 @@ def resume_model_and_optimizer(model, load_dir, tag):
     Utility function for checkpointing model + optimizer dictionaries
     The main purpose for this is to be able to resume training from that instant again
     """
-    _, checkpoint_state_dict = model.load_checkpoint(load_dir, tag = tag, load_optimizer_states = True)
+    load_path, checkpoint_state_dict = model.load_checkpoint(load_dir, tag = tag, load_optimizer_states = True, load_lr_scheduler_states = True)
+    if load_path is None:
+        raise ValueError("[deepspeed] failed to load checkpoint from {}".format(load_dir))
     
     last_global_step = checkpoint_state_dict["last_global_step"]
     del checkpoint_state_dict
 
     return last_global_step
 
-def checkpoint_model(accelerator, model, tokenizer, output_ckpt_dir, last_global_step):    
+def checkpoint_model(accelerator, model, tokenizer, output_ckpt_dir, last_global_step, max_num_ckpts):    
     '''
     Utility fuction for only checkpointing the model dictionary (i.e., only model parameters)
     '''
+    # remove the old checkpoint to make sure the number of checkpoints is less than max_num_ckpts
+    if accelerator.is_main_process:
+        checkpoint_dirs = glob.glob(os.path.join(output_ckpt_dir, "ckpt-*"))
+        if len(checkpoint_dirs) >= max_num_ckpts:
+            oldest_checkpoint_dir = min(checkpoint_dirs, key=lambda x: int(x.split('-')[-1]))
+            accelerator.print(f"Removing oldest checkpoint directory: {oldest_checkpoint_dir}")
+            import shutil
+            shutil.rmtree(oldest_checkpoint_dir)
+
+
     ckpt_path = os.path.join(output_ckpt_dir, "ckpt-{}".format(last_global_step))
     accelerator.print("checkpointing model state dict at {}".format(ckpt_path))
     unwrapped_model = accelerator.unwrap_model(model)
@@ -125,12 +154,16 @@ def train(opt):
     accelerator = Accelerator()
     print("accelerator.is_main_process:", accelerator.is_main_process)
     print("accelerator.device:", accelerator.device)
-
     total_batch_size = opt.per_device_train_batch_size * accelerator.num_processes * accelerator.gradient_accumulation_steps
     
     accelerator.print(opt)
     accelerator.print("tokens per batch:", total_batch_size * opt.block_size)
     accelerator.print("sequences per batch:", total_batch_size)
+
+    # Early stopping variables
+    best_val_loss = float('inf')
+    patience_counter = 0
+    best_model_path = None
 
     # We first search for the most recent checkpoint directory, if it doesn't exist, we start a new run
     most_recent_ckpt_dir = None
@@ -153,8 +186,10 @@ def train(opt):
     model = AutoModelForCausalLM.from_pretrained(opt.pretrained_model_name_or_path, 
                                                  attn_implementation = "flash_attention_2", 
                                                  torch_dtype = torch.bfloat16)
-    tokenizer.pad_token_id = tokenizer.eos_token_id
-    model.config.pad_token_id = tokenizer.eos_token_id
+    
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        model.config.pad_token_id = model.config.eos_token_id
     
     # enable gradient checkpointing to save GPU memory, but this action would slowdown the training speed 20-30%
     model.config.use_cache = False # disable use_cache to enable gradient checkpointing
@@ -164,12 +199,16 @@ def train(opt):
         if accelerator.is_main_process:
             sanity_check(dataset[0]["input_ids"], dataset[0]["labels"], tokenizer)
     elif opt.mode == "sft":
-        dataset = SFTSQLGenerationDataset(opt.text2sql_data_dir, tokenizer, opt.block_size, "train", opt.table_num, opt.column_num, None)
+        train_dataset = SFTSQLGenerationDataset(opt.text2sql_data_dir, tokenizer, opt.block_size, opt.prompt_mode, opt.table_num, 
+                                          opt.column_num, None)
+        eval_dataset = SFTSQLGenerationDataset(opt.text2sql_data_dir, tokenizer, opt.block_size, opt.prompt_mode, opt.table_num, 
+                                          opt.column_num, None, mode = "eval")
     else:
         raise ValueError("opt.mode should be in [pt, sft].")
-    dataloader = DataLoader(dataset, batch_size = opt.per_device_train_batch_size, shuffle = True, drop_last = True)
-
-    num_total_batches = math.ceil(opt.epochs * math.ceil(len(dataset) / total_batch_size)) # number of total batches
+    train_dataloader = DataLoader(train_dataset, batch_size = opt.per_device_train_batch_size, shuffle = True, drop_last = True)
+    eval_dataloader = DataLoader(eval_dataset, batch_size = opt.per_device_train_batch_size, shuffle = True, drop_last = True)
+    
+    num_total_batches = math.ceil(opt.epochs * math.ceil(len(train_dataset) / total_batch_size)) # number of total batches
     optimizer = AdamW(model.parameters(), lr = opt.lr, betas = (0.9, 0.95), eps = 1e-8, weight_decay = 0.1)
 
     num_warm_up_batches = max(int(num_total_batches * opt.warmup_ratio), 1)
@@ -182,10 +221,11 @@ def train(opt):
         eta_min = 0.1 * opt.lr
     )
 
-    optimizer, model, dataloader, lr_scheduler = accelerator.prepare(optimizer, model, dataloader, lr_scheduler)
+    optimizer, model, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(optimizer, model, train_dataloader, eval_dataloader, lr_scheduler)
     print(type(optimizer))
     print(type(model))
-    print(type(dataloader))
+    print(type(train_dataloader))
+    print(type(eval_dataloader))
     print(type(lr_scheduler))
 
     accumulation_loss = 0
@@ -197,10 +237,11 @@ def train(opt):
     # Resume training if checkpoint exists
     if most_recent_ckpt_dir:
         # Extract checkpoint number for the resume_tag
+        accelerator.print(f"Resuming from checkpoint {opt.resume_from_checkpoint}/{opt.resume_tag}")
         global_completed_steps = resume_model_and_optimizer(model, opt.resume_from_checkpoint, opt.resume_tag)
         
-        resume_epoch = global_completed_steps * accelerator.gradient_accumulation_steps // len(dataloader)
-        resume_batch_idx = global_completed_steps * accelerator.gradient_accumulation_steps % len(dataloader)
+        resume_epoch = global_completed_steps * accelerator.gradient_accumulation_steps // len(train_dataloader)
+        resume_batch_idx = global_completed_steps * accelerator.gradient_accumulation_steps % len(train_dataloader)
 
         accelerator.print("resume epoch:", resume_epoch)
         accelerator.print("resume batch index:", resume_batch_idx)
@@ -258,25 +299,23 @@ def train(opt):
             accelerator.print("skip {}-th epoch".format(epoch))
             continue
         accelerator.print("Start training epoch:", epoch+1)
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc = "Training epoch {}".format(epoch+1))):
-
+        
+        # Training phase
+        model.train()
+        for batch_idx, batch in enumerate(tqdm(train_dataloader, desc = "Training epoch {}".format(epoch+1))):
             if opt.resume_from_checkpoint and resume_batch_idx > batch_idx:
                 accelerator.print("skip {}-th batch".format(batch_idx))
                 continue
             
-            # `accelerator.accumulate(model)` aims to set right `sync_gradients` state based on the recorded training steps
             with accelerator.accumulate(model):
                 outputs = model(**batch)
                 loss = outputs.loss
                 accumulation_loss += loss.detach().float()
-                # when deepspeed is enabled, `accelerator.backward(loss)` is doing optimizer.step(), optimizer.zero_grad(), and grad accumulation automatically. 
-                # see `if self.is_gradient_accumulation_boundary():` line in path-to-env/site-packages/deepspeed/runtime/engine.py
                 accelerator.backward(loss)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
             
-            # 'accelerator.sync_gradients' checks if the accelerator has performed an optimization step on the `total_batch_size` examples
             if accelerator.sync_gradients:
                 global_completed_steps += 1
                 loss_value = accumulation_loss / accelerator.gradient_accumulation_steps
@@ -288,36 +327,78 @@ def train(opt):
                 st = time.time()
 
                 if accelerator.is_main_process:
-                    # Replace wandb logging with Neptune logging
                     run["train/loss"].append(loss_value)
                     run["train/learning_rate"].append(lr_value)
                     run["train/step"].append(global_completed_steps)
 
                 accumulation_loss = 0
 
-                # save checkpoints for each checkpointing_steps total batch size
                 if global_completed_steps % opt.checkpointing_steps == 0:
                     accelerator.wait_for_everyone()
-                    checkpoint_model(accelerator, model, tokenizer, opt.output_ckpt_dir, global_completed_steps)
+                    checkpoint_model(accelerator, model, tokenizer, opt.output_ckpt_dir, global_completed_steps, opt.max_num_ckpts)
                     if opt.save_all_states:
-                        # Remove the old checkpoint directory and its contents before saving new ones
-                        old_ckpt_dir = os.path.join(opt.output_ckpt_dir, str(opt.resume_tag))
-                        if os.path.exists(old_ckpt_dir):
-                            import shutil
-                            shutil.rmtree(old_ckpt_dir)
+                        if accelerator.is_main_process:
+                            old_ckpt_dir = os.path.join(opt.output_ckpt_dir, str(opt.resume_tag))
+                            accelerator.print(f"Removing old optimizer states checkpoint directory: {old_ckpt_dir}")
+                            if os.path.exists(old_ckpt_dir):
+                                import shutil
+                                shutil.rmtree(old_ckpt_dir)
                         
-                        checkpoint_model_optimizer_scheduler(opt.output_ckpt_dir, model, global_completed_steps, lr_scheduler, accelerator)
+                        checkpoint_model_optimizer_scheduler(opt.output_ckpt_dir, model, global_completed_steps, lr_scheduler, accelerator, opt.max_num_ckpts)
                         opt.resume_tag = global_completed_steps
 
-        accelerator.print("in the end of an epoch, save a checkpoint")
-        accelerator.wait_for_everyone()
-        checkpoint_model(accelerator, model, tokenizer, opt.output_ckpt_dir, global_completed_steps)
-        if opt.save_all_states:
-            checkpoint_model_optimizer_scheduler(opt.output_ckpt_dir, model, global_completed_steps, lr_scheduler, accelerator)
+        # Validation phase
+        model.eval()
+        val_loss = 0
+        val_steps = 0
+        with torch.no_grad():
+            for batch in tqdm(eval_dataloader, desc="Validation"):
+                outputs = model(**batch)
+                val_loss += outputs.loss.detach().float()
+                val_steps += 1
+        
+        val_loss = val_loss / val_steps
+        accelerator.print(f"Validation loss at epoch {epoch+1}: {val_loss}")
+        
+        if accelerator.is_main_process:
+            run["val/loss"].append(val_loss)
+            run["val/epoch"].append(epoch + 1)
 
-    # Stop Neptune run instead of wandb
+        # Early stopping check
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            # Save best model
+            best_model_path = os.path.join(opt.output_ckpt_dir, f"best_model_epoch_{epoch+1}")
+            accelerator.wait_for_everyone()
+            checkpoint_model(accelerator, model, tokenizer, best_model_path, global_completed_steps, opt.max_num_ckpts)
+            accelerator.print(f"New best model saved with validation loss: {best_val_loss}")
+        else:
+            patience_counter += 1
+            accelerator.print(f"No improvement in validation loss for {patience_counter} epochs")
+            
+            if patience_counter >= opt.patience:
+                accelerator.print(f"Early stopping triggered after {epoch + 1} epochs")
+                break
+
+        # Save regular checkpoint at end of epoch
+        accelerator.wait_for_everyone()
+        checkpoint_model(accelerator, model, tokenizer, opt.output_ckpt_dir, global_completed_steps, opt.max_num_ckpts)
+        if opt.save_all_states:
+            if accelerator.is_main_process:
+                old_ckpt_dir = os.path.join(opt.output_ckpt_dir, str(opt.resume_tag))
+                accelerator.print(f"Removing old optimizer states checkpoint directory: {old_ckpt_dir}")
+                if os.path.exists(old_ckpt_dir):
+                    import shutil
+                    shutil.rmtree(old_ckpt_dir)
+            checkpoint_model_optimizer_scheduler(opt.output_ckpt_dir, model, global_completed_steps, lr_scheduler, accelerator, opt.max_num_ckpts)
+            opt.resume_tag = global_completed_steps
+
+    # Stop Neptune run
     if accelerator.is_main_process:
         run.stop()
+        
+    return best_model_path
 
 if __name__ == "__main__":
     # write_basic_config() # initialize the distributed environment using accelerate

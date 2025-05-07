@@ -78,6 +78,7 @@ def package_sqls(sql_path, db_root_path, mode='gpt', data_mode='dev'):
         sql_txt = sqls.readlines()
         # sql_txt = [sql.split('\t')[0] for sql in sql_txt]
         for idx, sql_str in enumerate(sql_txt):
+            print(sql_str)
             sql, db_name = sql_str.strip().split('\t')
             clean_sqls.append(sql)
             db_path_list.append(db_root_path + db_name + '/' + db_name + '.sqlite')
@@ -155,6 +156,10 @@ if __name__ == '__main__':
                                            data_mode=args.data_mode)
 
     query_pairs = list(zip(pred_queries,gt_queries))
+    for query_pair in query_pairs:
+        print(query_pair[0])
+        print(query_pair[1])
+        break
     run_sqls_parallel(query_pairs, db_places=db_paths, num_cpus=args.num_cpus, meta_time_out=args.meta_time_out)
     exec_result = sort_results(exec_result)
     

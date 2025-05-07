@@ -9,4 +9,5 @@ wandb/
 train_logs/
 results/
 qwen_7b_predictions/
+results/
 *slurm*.sh

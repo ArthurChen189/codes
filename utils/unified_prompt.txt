@@ -1,0 +1,5 @@
+${schema_with_rows}
+
+-- External Knowledge: ${external_knowledge}
+-- Using valid SQLite and understanding External Knowledge, answer the following questions for the tables provided above
+Question: ${question}

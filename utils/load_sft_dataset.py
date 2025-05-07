@@ -6,11 +6,27 @@ from datasets import Dataset
 from torch.utils.data import Dataset
 from schema_item_filter import SchemaItemClassifierInference, filter_schema
 from utils.db_utils import get_db_schema_sequence, get_matched_content_sequence
+from string import Template
 
-def prepare_text2sql_prefix_sequence(data):
-    prefix_seq = data["schema_sequence"] + "\n" + data["content_sequence"] + "\n" + data["text"] + "\n"
+# INPUT_PROMPT = "You are given a SQLite database schema that includes table name, columns, data types and exemplar values. You are tasked to ask questions about the database by referencing the provided schema.\n"
+TRAIN_ZERO_SHOT_PROMPT = "You are given a natural language question. You are tasked to answer the question by using a SQLite query. Do not include any other text in your response.\n"
+EVAL_ZERO_SHOT_PROMPT_TEMPLATE = Template(open("utils/unified_prompt.txt", "r").read())
+
+def prepare_text2sql_prefix_sequence(data, prompt_template = None) -> str:
+    prefix_seq = ""
+    if prompt_template is not None:
+        prefix_seq = str(prompt_template.substitute(question=data["question"], 
+                                                      schema_with_rows=data["schema_sequence"], 
+                                                      external_knowledge=data["evidence"]))
+    else:
+        prefix_seq = data["schema_sequence"] + "\n" + data["content_sequence"] + "\n" + data["text"] + "\n"
     
     return prefix_seq
+
+def prepare_text2sql_prefix_sequence_zero_shot(data):
+    text = data["question"]
+
+    return "\n" + text + "\n"
 
 ####################################################### this is for Qwen2.5
 def prepare_inputs_and_labels_qwen(prefix_seq, target_seq, tokenizer, max_tokens):
@@ -29,7 +45,7 @@ def prepare_inputs_and_labels_qwen(prefix_seq, target_seq, tokenizer, max_tokens
         attention_mask = [1] * seq_length + [0] * pad_length
         # only target_ids produces gradients
         labels = [-100] * len(prefix_ids) + target_ids + [-100] * pad_length
-    else: # no padding
+    else: # no padding, meaning the input sequence exceeds the max_tokens
         print("the current input sequence exceeds the max_tokens, we will truncate it.")
         input_ids = prefix_ids + target_ids
         # pre-truncate input ids
@@ -108,28 +124,42 @@ def prepare_inputs(prefix_seq, tokenizer, max_prefix_length):
     }
 
 class SFTSQLGenerationDataset(Dataset):
-    def __init__(self, text2sql_data_dir, tokenizer, max_tokens, mode, table_num, column_num, sic_path):
+    def __init__(self, text2sql_data_dir, tokenizer, max_tokens, mode, table_num, column_num, sic_path, 
+                 filter=True, target_key="sql", input_prompt="", seed=42):
         super().__init__()
+        import numpy as np
         dataset = json.load(open(text2sql_data_dir))
+        train_dataset = np.random.RandomState(seed).choice(dataset, size=int(len(dataset) * 0.8), replace=False)
+        eval_dataset = np.setdiff1d(dataset, train_dataset)
+        if mode == "train":
+            dataset = train_dataset
+        elif mode == "eval":
+            dataset = eval_dataset
+        else:
+            raise ValueError(f"mode {mode} is not supported")
+        print(f"==Loaded {len(dataset)} examples for {mode} set==")
+        self.target_key = target_key
+        self.input_prompt = input_prompt
         # print(f" skipping schemafiltering strategies...")
         # Let's not apply filtering strategies.
         
         print("apply filtering strategies...")
         if mode == "train":
-            dataset = filter_schema(dataset, "train", None, table_num, column_num)
-        elif mode == "data-synthesis":
-            print("data-synthesis mode, we skip the schema filtering step.")
+            if filter:
+                dataset = filter_schema(dataset, "train", None, table_num, column_num)
         elif mode == "eval":
             sic = SchemaItemClassifierInference(sic_path)
-            dataset = filter_schema(dataset, "eval", sic, table_num, column_num)
+            if filter:
+                dataset = filter_schema(dataset, "eval", sic, table_num, column_num)
             del sic
             torch.cuda.empty_cache()
 
-        # prepare schema sequence and content sequence
-        for data in dataset:
-            # get the schema and matched contents prompt
-            data["schema_sequence"] = get_db_schema_sequence(data["schema"])
-            data["content_sequence"] = get_matched_content_sequence(data["matched_contents"])
+        if "train-zero-shot" not in mode:
+            # prepare schema sequence and content sequence
+            for data in dataset:
+                # get the schema and matched contents prompt
+                data["schema_sequence"] = get_db_schema_sequence(data["schema"])
+                data["content_sequence"] = get_matched_content_sequence(data["matched_contents"])
 
         self.mode = mode
         self.dataset = dataset
@@ -138,15 +168,18 @@ class SFTSQLGenerationDataset(Dataset):
 
     def __getitem__(self, index):
         data = self.dataset[index]
-        prefix_seq = prepare_text2sql_prefix_sequence(data)
+        prefix_seq = self.input_prompt + prepare_text2sql_prefix_sequence(data)
+
         if index < 2:
             print(prefix_seq)
 
-        if self.mode == "train":
-            target_seq = data["sql"]
+        if "train" in self.mode:
+            target_seq = data[self.target_key]
             return prepare_inputs_and_labels_qwen(prefix_seq, target_seq, self.tokenizer, self.max_tokens)
-        elif self.mode == "eval":
+        elif "eval" in self.mode:
             return prepare_inputs_qwen(prefix_seq, self.tokenizer, self.max_tokens)
+        else:
+            raise ValueError(f"mode {self.mode} is not supported")
 
     def __len__(self):
         return len(self.dataset)

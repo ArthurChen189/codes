@@ -17,11 +17,11 @@ def parse_option():
     parser.add_argument('--output_path', type = str)
     parser.add_argument('--table_num', type = int, default = 6)
     parser.add_argument('--column_num', type = int, default = 10)
-
     parser.add_argument('--dataset_path', type = str)
 
     parser.add_argument('--max_tokens', type = int, default = 4096)
     parser.add_argument('--max_new_tokens', type = int, default = 256)
+    parser.add_argument('--mode', type = str, default = "eval")
     
     opt = parser.parse_args()
 
@@ -68,7 +68,7 @@ if __name__ == "__main__":
         opt.dataset_path,
         tokenizer,
         max_tokens - max_new_tokens,
-        "eval",
+        opt.mode,
         opt.table_num,
         opt.column_num,
         opt.sic_path
@@ -76,7 +76,7 @@ if __name__ == "__main__":
 
     # TODO: current, we only support batch size = 1
     dataloader = DataLoader(eval_set, batch_size = 1)
-    model = AutoModelForCausalLM.from_pretrained(opt.llm_path, device_map = "auto", torch_dtype = torch.float16, 
+    model = AutoModelForCausalLM.from_pretrained(opt.llm_path, device_map = "auto", torch_dtype = torch.bfloat16, 
                                                  attn_implementation = "flash_attention_2")
     # model = AutoModelForCausalLM.from_pretrained(opt.llm_path, device_map = "auto", torch_dtype = torch.float16)
     model.eval()
